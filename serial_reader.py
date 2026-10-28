@@ -1,7 +1,7 @@
 """
 SmartVolt AI — Serial Communication & Data Acquisition Engine
 Handles COM port discovery, robust background serial streaming, 
-fault-tolerant telemetry parsing, and simulation mode.
+fault-tolerant telemetry parsing, stale data detection, and Simulation Lab.
 """
 
 import time
@@ -36,16 +36,20 @@ def parse_serial_message(line: str) -> Dict[str, any]:
     """
     Parses incoming serial lines from the ESP8266.
     Target format: "Temperature: 27.50 C"
-    Also handles whitespace variations, sensor fault codes (-127°C, 85°C), 
+    Also handles variations, sensor fault codes (-127°C, 85°C), 
     and arbitrary numeric telemetry.
     """
     result = {
-        "raw": line.strip(),
+        "raw": line.strip() if line else "",
         "temperature": None,
         "is_valid": False,
         "fault_type": None,
         "message": ""
     }
+
+    if not line:
+        result["message"] = "Empty serial packet"
+        return result
 
     cleaned = line.strip()
     if not cleaned:
@@ -72,7 +76,7 @@ def parse_serial_message(line: str) -> Dict[str, any]:
             if abs(temp_val - (-127.0)) < 0.05:
                 result["is_valid"] = False
                 result["fault_type"] = "SENSOR_DISCONNECTED"
-                result["message"] = "DS18B20 1-Wire disconnected or pull-up missing (-127°C)"
+                result["message"] = "DS18B20 1-Wire disconnected or 4.7kΩ pull-up missing (-127°C)"
             elif abs(temp_val - 85.0) < 0.05:
                 result["is_valid"] = False
                 result["fault_type"] = "POWER_ON_RESET"
@@ -80,7 +84,7 @@ def parse_serial_message(line: str) -> Dict[str, any]:
             elif temp_val < -55.0 or temp_val > 125.0:
                 result["is_valid"] = False
                 result["fault_type"] = "OUT_OF_RANGE"
-                result["message"] = f"Reading {temp_val}°C outside sensor physical range (-55 to +125°C)"
+                result["message"] = f"Reading {temp_val}°C outside physical sensor range (-55 to +125°C)"
             else:
                 result["is_valid"] = True
                 result["message"] = f"Valid temperature: {temp_val:.2f} °C"
@@ -89,6 +93,7 @@ def parse_serial_message(line: str) -> Dict[str, any]:
             result["message"] = f"Parse conversion error: {str(err)}"
     else:
         result["is_valid"] = False
+        result["fault_type"] = "INVALID_FORMAT"
         result["message"] = f"Unrecognized serial format: '{cleaned}'"
 
     return result
@@ -97,8 +102,8 @@ def parse_serial_message(line: str) -> Dict[str, any]:
 class SmartVoltSerialManager:
     """
     Non-blocking, thread-safe serial port manager for ESP8266 telemetry.
-    Maintains a rolling buffer of telemetry records and isolates Streamlit 
-    from I/O blocking.
+    Maintains a rolling buffer of telemetry records, isolates Streamlit 
+    from I/O blocking, and detects stale or dropped connections.
     """
 
     def __init__(self, max_history: int = 1000):
@@ -125,9 +130,7 @@ class SmartVoltSerialManager:
         self.last_packet_time: Optional[datetime] = None
 
     def connect(self, port: str, baudrate: int = 115200) -> Tuple[bool, str]:
-        """
-        Attempts to open the serial port and spawns the background worker thread.
-        """
+        """Attempts to open the serial port and spawns the background worker thread."""
         if self.is_connected:
             self.disconnect()
 
@@ -142,14 +145,12 @@ class SmartVoltSerialManager:
                 timeout=1.0,
                 write_timeout=1.0
             )
-            # Flush existing hardware buffer noise
             self.ser.reset_input_buffer()
             self.is_connected = True
             self.status = "CONNECTED"
             self.connected_since = datetime.now()
             self.stop_event.clear()
 
-            # Start non-blocking reader thread
             self.thread = threading.Thread(
                 target=self._worker_loop,
                 name=f"SmartVoltSerial-{port}",
@@ -164,8 +165,8 @@ class SmartVoltSerialManager:
             self.status = "ERROR"
             if "PermissionError" in error_msg or "Access is denied" in error_msg:
                 self.last_error = (
-                    f"Access Denied on {port}. Please verify that the Arduino IDE "
-                    "Serial Monitor, PuTTY, or other serial tools are closed."
+                    f"Access Denied on {port}. Please verify that Arduino IDE "
+                    "Serial Monitor, PuTTY, or other serial terminals are closed."
                 )
             elif "FileNotFoundError" in error_msg or "cannot find" in error_msg:
                 self.last_error = f"{port} was disconnected or not found."
@@ -195,6 +196,12 @@ class SmartVoltSerialManager:
         self.status = "DISCONNECTED"
         self.ser = None
 
+    def is_stale(self, timeout_seconds: float = 4.0) -> bool:
+        """Returns True if the serial link is connected but no reading arrived within timeout."""
+        if not self.is_connected or not self.last_packet_time:
+            return False
+        return (datetime.now() - self.last_packet_time).total_seconds() > timeout_seconds
+
     def _worker_loop(self):
         """Background thread executing blocking readline() calls safely."""
         while not self.stop_event.is_set():
@@ -204,7 +211,7 @@ class SmartVoltSerialManager:
             try:
                 line_bytes = self.ser.readline()
                 if not line_bytes:
-                    continue  # Timeout occurred, loop again
+                    continue
 
                 line_str = line_bytes.decode("utf-8", errors="replace").strip()
                 if not line_str:
@@ -219,6 +226,7 @@ class SmartVoltSerialManager:
                     "temperature": parse_res["temperature"],
                     "voltage": None,  # Hardware voltage locked per safety protocol
                     "source": "HARDWARE",
+                    "device_status": "CONNECTED",
                     "is_valid": parse_res["is_valid"],
                     "raw": parse_res["raw"],
                     "message": parse_res["message"],
@@ -233,7 +241,6 @@ class SmartVoltSerialManager:
                     self.buffer.append(record)
 
             except serial.SerialException as ex:
-                # Cable unplugged or hardware port reset
                 self.last_error = f"COM port disconnected unexpectedly: {str(ex)}"
                 self.status = "DISCONNECTED"
                 self.is_connected = False
@@ -244,7 +251,7 @@ class SmartVoltSerialManager:
                 time.sleep(0.1)
 
     def get_latest_reading(self) -> Optional[Dict]:
-        """Returns the most recent valid telemetry record."""
+        """Returns the most recent telemetry record."""
         with self.lock:
             if not self.buffer:
                 return None
@@ -267,9 +274,12 @@ class SmartVoltSerialManager:
 
     def get_diagnostics(self) -> Dict:
         """Returns hardware serial health and link status."""
+        stale = self.is_stale()
+        link_state = "STALE" if stale else self.status
         return {
-            "status": self.status,
+            "status": link_state,
             "is_connected": self.is_connected,
+            "is_stale": stale,
             "port": self.port_name,
             "baudrate": self.baudrate,
             "packets_received": self.packets_received,
@@ -281,16 +291,61 @@ class SmartVoltSerialManager:
 
 class SmartVoltSimulationEngine:
     """
-    High-fidelity simulation engine for laboratory demonstrations.
-    Emulates realistic ESP8266 telemetry with customizable operating scenarios:
-    - Normal steady state (room temperature baseline + minor noise)
-    - Thermal runaway (exponential thermal surge)
-    - Sudden thermal shock (rapid temperature spike)
-    - Sensor 1-Wire disconnection fault (-127°C)
-    - Simulated 12V DC power bus with voltage sag and surge
-    
-    *ALL DATA PRODUCED IS EXPLICITLY LABELED 'SIMULATED'*
+    Dedicated Simulation & Test Lab Engine.
+    Generates reproducible, controllable IoT test scenarios for laboratory demonstration.
+    ALL DATA PRODUCED IS EXPLICITLY LABELED 'SIMULATED'.
     """
+
+    SCENARIO_INFO = {
+        "NORMAL": {
+            "title": "Normal Baseline Operation",
+            "description": "Nominal room temperature with minor natural sensor noise (~26.5°C ± 0.3°C).",
+            "expected_behavior": "Baseline tracking; system reports Normal status with 0 anomalies.",
+            "expected_severity": "NORMAL"
+        },
+        "GRADUAL_RISE": {
+            "title": "Slow Gradual Temperature Rise",
+            "description": "Slow thermal drift (+0.08°C/s over 60s) simulating ambient afternoon drift or warming load.",
+            "expected_behavior": "Rolling median adapts smoothly without triggering false statistical alerts.",
+            "expected_severity": "NORMAL"
+        },
+        "TEMPERATURE_SPIKE": {
+            "title": "Sudden Temperature Spike",
+            "description": "Abrupt transient impulse (+15°C surge) simulating momentary contact resistance or arcing.",
+            "expected_behavior": "Sample 1 debounced as Transient Spike; Sample 2 latches persistent Anomaly.",
+            "expected_severity": "WARNING"
+        },
+        "OVERHEATING": {
+            "title": "Thermal Runaway / Overheating",
+            "description": "Continuous exponential thermal surge reaching 55°C - 68°C.",
+            "expected_behavior": "Breaches Warning (40°C) and Critical (50°C) limits, triggering critical alerts.",
+            "expected_severity": "CRITICAL"
+        },
+        "VOLTAGE_FLUCTUATION": {
+            "title": "12V DC Bus Ripple",
+            "description": "Simulated nominal 12V DC power bus with mild electrical ripple (11.8V to 12.3V).",
+            "expected_behavior": "Displays simulated voltage curve within normal power supply tolerances.",
+            "expected_severity": "NORMAL"
+        },
+        "VOLTAGE_UNDER_OVER": {
+            "title": "Voltage Sag & Surge Transients",
+            "description": "Simulated undervoltage sag (8.8V) followed by an alternator overvoltage surge (16.4V).",
+            "expected_behavior": "Flags power quality anomalies on the simulated voltage trajectory.",
+            "expected_severity": "WARNING"
+        },
+        "MISSING_STALE": {
+            "title": "Missing / Stale Sensor Communication",
+            "description": "Emulates communication freeze or packet drop where telemetry stops arriving.",
+            "expected_behavior": "Diagnostics panel detects stale link timeout (> 4s without packet).",
+            "expected_severity": "WARNING"
+        },
+        "SENSOR_FAULT": {
+            "title": "1-Wire Sensor Disconnect Fault",
+            "description": "Emulates unplugged DS18B20 data probe, generating -127.00°C hardware error code.",
+            "expected_behavior": "Parser intercepts fault code and flags SENSOR_FAULT without crashing.",
+            "expected_severity": "CRITICAL"
+        }
+    }
 
     def __init__(self, max_history: int = 1000):
         self.max_history = max_history
@@ -298,36 +353,47 @@ class SmartVoltSimulationEngine:
         self.lock = threading.Lock()
 
         # Physical thermal simulation state
-        self.base_temp = 26.8
-        self.current_temp = 26.8
+        self.base_temp = 26.5
+        self.current_temp = 26.5
         self.current_voltage = 12.08
         self.scenario = "NORMAL"
+        self.is_running = True
         self.step_counter = 0
-
-        # Simulation metrics
         self.packets_generated = 0
-        self.start_time = datetime.now()
+        self.rng = random.Random(42)
 
     def set_scenario(self, scenario: str):
-        """Updates active simulation profile."""
-        valid_scenarios = [
-            "NORMAL",
-            "THERMAL_RUNAWAY",
-            "TEMPERATURE_SPIKE",
-            "SENSOR_FAULT",
-            "VOLTAGE_SAG",
-            "VOLTAGE_SURGE"
-        ]
-        if scenario in valid_scenarios:
+        """Updates active simulation scenario and resets state parameters."""
+        if scenario in self.SCENARIO_INFO:
             self.scenario = scenario
-            if scenario == "NORMAL":
-                self.current_temp = 26.8
+            if scenario in ["NORMAL", "VOLTAGE_FLUCTUATION"]:
+                self.current_temp = 26.5
                 self.current_voltage = 12.08
+            elif scenario == "GRADUAL_RISE":
+                self.current_temp = 26.5
+
+    def start(self):
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+    def reset(self):
+        """Resets simulation back to nominal normal state."""
+        with self.lock:
+            self.base_temp = 26.5
+            self.current_temp = 26.5
+            self.current_voltage = 12.08
+            self.scenario = "NORMAL"
+            self.step_counter = 0
+            self.packets_generated = 0
+            self.buffer.clear()
+            self.rng = random.Random(42)
 
     def tick(self) -> Dict:
         """
         Generates one simulated telemetry point according to active scenario.
-        Returns the new record.
+        ALL DATA IS EXPLICITLY LABELED 'SIMULATED'.
         """
         now = datetime.now()
         self.step_counter += 1
@@ -336,48 +402,59 @@ class SmartVoltSimulationEngine:
         is_valid = True
         fault_type = None
         message = "Normal simulated operation"
+        device_status = "SIMULATING"
 
-        # Apply Scenario Dynamics
         if self.scenario == "NORMAL":
-            # Natural thermal wander around room temperature (25.5°C to 28.0°C)
-            noise = random.gauss(0, 0.12)
-            drift = 0.4 * (random.random() - 0.5)
-            self.current_temp = max(24.0, min(30.0, self.current_temp + drift * 0.1 + noise * 0.2))
-            self.current_voltage = max(11.85, min(12.35, 12.10 + random.gauss(0, 0.04)))
+            noise = self.rng.gauss(0, 0.12)
+            drift = 0.3 * (self.rng.random() - 0.5)
+            self.current_temp = max(24.5, min(28.5, self.current_temp + drift * 0.1 + noise * 0.2))
+            self.current_voltage = max(11.85, min(12.35, 12.10 + self.rng.gauss(0, 0.04)))
             message = "Simulated normal thermal equilibrium"
 
-        elif self.scenario == "THERMAL_RUNAWAY":
-            # Progressively climbing temperature simulating cooling failure
-            heat_gain = 0.85 + random.uniform(0.1, 0.4)
-            self.current_temp = min(68.5, self.current_temp + heat_gain)
-            self.current_voltage = 11.95 - (self.current_temp - 26.0) * 0.03
-            message = f"SIMULATED THERMAL RUNAWAY: Overheating at {self.current_temp:.1f}°C"
+        elif self.scenario == "GRADUAL_RISE":
+            # Slow 0.08°C rise per step up to ~34°C
+            self.current_temp = min(34.5, self.current_temp + 0.08 + self.rng.gauss(0, 0.04))
+            self.current_voltage = 12.05 + self.rng.gauss(0, 0.03)
+            message = f"SIMULATED GRADUAL DRIFT: Ambient rising ({self.current_temp:.2f}°C)"
 
         elif self.scenario == "TEMPERATURE_SPIKE":
-            # Abrupt transient jump (+12°C to +18°C)
-            self.current_temp = self.base_temp + 16.5 + random.gauss(0, 0.3)
-            self.current_voltage = 11.75 + random.gauss(0, 0.1)
-            message = "SIMULATED TRANSIENT SPIKE: High thermal impulse detected"
+            self.current_temp = self.base_temp + 15.2 + self.rng.gauss(0, 0.3)
+            self.current_voltage = 11.75 + self.rng.gauss(0, 0.1)
+            message = "SIMULATED TRANSIENT SPIKE: Sudden thermal impulse"
+
+        elif self.scenario == "OVERHEATING":
+            # Thermal runaway climbing past 40°C and 50°C
+            self.current_temp = min(68.5, self.current_temp + 0.85 + self.rng.uniform(0.1, 0.3))
+            self.current_voltage = 11.90 - (self.current_temp - 26.0) * 0.02
+            message = f"SIMULATED THERMAL RUNAWAY: {self.current_temp:.1f}°C"
+
+        elif self.scenario == "VOLTAGE_FLUCTUATION":
+            self.current_temp = self.base_temp + self.rng.gauss(0, 0.1)
+            self.current_voltage = 12.0 + 0.3 * (self.rng.random() - 0.5)
+            message = "SIMULATED DC BUS: Normal nominal ripple"
+
+        elif self.scenario == "VOLTAGE_UNDER_OVER":
+            self.current_temp = self.base_temp + self.rng.gauss(0, 0.1)
+            # Alternate between sag (8.8V) and surge (16.2V)
+            if (self.step_counter // 5) % 2 == 0:
+                self.current_voltage = 8.85 + self.rng.uniform(-0.1, 0.2)
+                message = f"SIMULATED VOLTAGE SAG: Bus dropped to {self.current_voltage:.2f}V"
+            else:
+                self.current_voltage = 16.30 + self.rng.uniform(-0.2, 0.3)
+                message = f"SIMULATED VOLTAGE SURGE: Bus spiked to {self.current_voltage:.2f}V"
+
+        elif self.scenario == "MISSING_STALE":
+            # Emulates stale communication: freezes readings
+            device_status = "STALE"
+            message = "SIMULATED STALE LINK: No fresh packets arriving"
 
         elif self.scenario == "SENSOR_FAULT":
-            # DS18B20 1-Wire error code
             self.current_temp = -127.00
             self.current_voltage = 12.05
             is_valid = False
             fault_type = "SENSOR_DISCONNECTED"
+            device_status = "ERROR"
             message = "SIMULATED FAULT: Probe disconnected (-127.00°C)"
-
-        elif self.scenario == "VOLTAGE_SAG":
-            # DC power supply undervoltage / heavy load pull
-            self.current_temp = self.base_temp + random.gauss(0, 0.1)
-            self.current_voltage = 8.85 + random.uniform(-0.15, 0.2)
-            message = f"SIMULATED VOLTAGE SAG: Bus dropped to {self.current_voltage:.2f}V"
-
-        elif self.scenario == "VOLTAGE_SURGE":
-            # Voltage surge / alternator regulator fault
-            self.current_temp = self.base_temp + random.gauss(0, 0.1)
-            self.current_voltage = 16.40 + random.uniform(-0.2, 0.4)
-            message = f"SIMULATED VOLTAGE SURGE: Bus spiked to {self.current_voltage:.2f}V"
 
         temp_rounded = round(self.current_temp, 2)
         volt_rounded = round(self.current_voltage, 2)
@@ -388,11 +465,12 @@ class SmartVoltSimulationEngine:
             "temperature": temp_rounded,
             "voltage": volt_rounded,
             "source": "SIMULATED",  # MANDATORY REQUIREMENT: ALWAYS LABELED SIMULATED
+            "device_status": device_status,
             "is_valid": is_valid,
             "raw": f"[SIMULATED] Temperature: {temp_rounded:.2f} C | Bus: {volt_rounded:.2f} V",
             "message": message,
             "fault_type": fault_type,
-            "scenario": self.scenario
+            "scenario_id": self.scenario
         }
 
         with self.lock:
@@ -419,4 +497,3 @@ class SmartVoltSimulationEngine:
             self.packets_generated = 0
             self.current_temp = self.base_temp
             self.current_voltage = 12.08
-

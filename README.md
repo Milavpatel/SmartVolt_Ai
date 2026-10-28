@@ -168,23 +168,29 @@ The workspace is structured into self-contained, modular components:
 
 ```
 c:\Users\MIlav\Desktop\smartvolt\
-├── app.py                     # Main Streamlit industrial monitoring dashboard
-├── serial_reader.py           # Non-blocking USB serial daemon & simulation engine
-├── model.py                   # Hybrid Anomaly Detector (Thresholds + MAD + Isolation Forest)
-├── test_anomaly_detector.py   # Automated 7-tier test suite with benchmark report
-├── requirements.txt           # Python dependency manifest
+├── app.py                     # Industrial Streamlit SCADA dashboard (6 multi-page views)
+├── serial_reader.py           # Non-blocking USB serial daemon, stale detection & Simulation Lab
+├── model.py                   # Hybrid Anomaly Detector (Thresholds + MAD + Isolation Forest + Joblib)
+├── database.py                # SQLite persistence layer (WAL mode, query filtering, cooldown)
+├── reports.py                 # PDF audit report generator (ReportLab) & CSV exporter
+├── test_smartvolt_suite.py    # 8-scenario comprehensive automated test suite
+├── test_anomaly_detector.py   # 7-scenario anomaly detector unit test suite
+├── requirements.txt           # Python dependency manifest (with reportlab & joblib)
 ├── esp8266_smartvolt.ino      # NodeMCU Arduino C++ firmware (115200 baud)
 ├── README.md                  # Complete engineering documentation
 └── data/
-    └── sample_telemetry.csv    # Pre-recorded benchmark telemetry dataset
+    ├── smartvolt.db           # SQLite database for telemetry and event audit logs
+    ├── models/                # Saved Scikit-Learn Isolation Forest models (.joblib)
+    └── sample_telemetry.csv   # Pre-recorded benchmark telemetry dataset
 ```
 
 ### Module Descriptions:
-- **`app.py`**: Modern, dark-themed responsive dashboard. Displays current temperature, separate threshold status (`NORMAL`, `WARNING`, `CRITICAL`), separate model status (`COLLECTING_DATA`, `NORMAL`, `ANOMALY`), dynamic rolling MAD statistical envelope, anomaly counts, and one-click baseline recalibration.
-- **`serial_reader.py`**: Multithreaded background worker. Reads raw bytes via `pyserial`, parses `Temperature: 27.50 C` regex patterns, filters sensor fault codes (`-127.00°C`), and handles unplug/reconnect events cleanly.
-- **`model.py`**: Hybrid anomaly engine. Integrates two-stage deterministic limits, rolling median & MAD with safe zero-variance floor, debounced persistence filtering, and Scikit-Learn Isolation Forest. Starts strictly in `COLLECTING_DATA` mode until real baseline samples accumulate.
-- **`test_anomaly_detector.py`**: 7 automated unit tests covering stable readings, gradual drift, sudden spikes, sensor faults, zero-variance flatline data, insufficient data, and labeled benchmark evaluation.
-- **`esp8266_smartvolt.ino`**: Optimized firmware utilizing `OneWire` and `DallasTemperature` libraries with 12-bit resolution ($0.0625^\circ\text{C}$) and non-blocking `millis()` sampling.
+- **`app.py`**: Industrial SCADA dashboard featuring 6 specialized pages: Live Overview, Simulation Lab, Historical Analytics, Model Evaluation, Reports & Audit Export, and Diagnostics.
+- **`serial_reader.py`**: Multithreaded background worker with stale link detection and an expanded 8-scenario simulation engine with expected vs actual response mapping.
+- **`model.py`**: Hybrid anomaly engine combining two-stage deterministic limits, rolling median & MAD with safe zero-variance floor, debounced persistence, Isolation Forest with Joblib model saving/loading, and zero-leakage comparative benchmarking.
+- **`database.py`**: Robust SQLite persistence engine storing all readings and anomaly events with duplicate cooldown throttling and advanced filtering.
+- **`reports.py`**: Generates publication-grade multi-page PDF inspection reports with summary statistics, confusion matrix benchmarks, event logs, and safety notices.
+- **`test_smartvolt_suite.py`**: Automated test suite verifying serial parsing, validation, thresholds, MAD statistics, ML persistence, SQLite writes, simulation labeling, and report generation.
 
 ---
 

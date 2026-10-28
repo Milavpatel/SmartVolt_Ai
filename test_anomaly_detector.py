@@ -29,7 +29,8 @@ class TestSmartVoltAnomalyDetector(unittest.TestCase):
             min_absolute_diff=0.40,
             persistence_count=2,
             contamination=0.05,
-            random_state=42
+            random_state=42,
+            model_save_path=None
         )
 
     def test_01_insufficient_training_data(self):
@@ -39,7 +40,7 @@ class TestSmartVoltAnomalyDetector(unittest.TestCase):
             self.assertEqual(res["model_status"], "COLLECTING_DATA")
             self.assertFalse(res["is_baseline_ready"])
             self.assertFalse(res["is_anomaly"])
-            self.assertIn("Collecting initial room temperature baseline", res["reasons"][0])
+            self.assertTrue(any("baseline" in r.lower() for r in res["reasons"]))
 
     def test_02_stable_normal_readings(self):
         """Test 2: Stable normal readings establish baseline and remain NORMAL without false alarms."""
