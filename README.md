@@ -17,10 +17,11 @@
 3. [Voltage Sensor Safety & ADC Verification Protocol](#-voltage-sensor-safety--adc-verification-protocol)
 4. [Machine Learning Methodology (Isolation Forest)](#-machine-learning-methodology-isolation-forest)
 5. [Software Architecture & File Manifest](#-software-architecture--file-manifest)
-6. [Windows Setup & Quickstart Guide](#-windows-setup--quickstart-guide)
-7. [Step-by-Step Faculty Demonstration Script](#-step-by-step-faculty-demonstration-script)
-8. [Comprehensive Viva Voce Q&A Kit](#-comprehensive-viva-voce-qa-kit)
-9. [Troubleshooting & FAQs](#-troubleshooting--faqs)
+6. [ThingSpeak Cloud Integration & Remote Monitoring (Option B)](#-thingspeak-cloud-integration--remote-monitoring-option-b)
+7. [Windows Setup & Quickstart Guide](#-windows-setup--quickstart-guide)
+8. [Step-by-Step Faculty Demonstration Script](#-step-by-step-faculty-demonstration-script)
+9. [Comprehensive Viva Voce Q&A Kit](#-comprehensive-viva-voce-qa-kit)
+10. [Troubleshooting & FAQs](#-troubleshooting--faqs)
 
 ---
 
@@ -168,29 +169,161 @@ The workspace is structured into self-contained, modular components:
 
 ```
 c:\Users\MIlav\Desktop\smartvolt\
-├── app.py                     # Industrial Streamlit SCADA dashboard (6 multi-page views)
-├── serial_reader.py           # Non-blocking USB serial daemon, stale detection & Simulation Lab
-├── model.py                   # Hybrid Anomaly Detector (Thresholds + MAD + Isolation Forest + Joblib)
-├── database.py                # SQLite persistence layer (WAL mode, query filtering, cooldown)
-├── reports.py                 # PDF audit report generator (ReportLab) & CSV exporter
-├── test_smartvolt_suite.py    # 8-scenario comprehensive automated test suite
-├── test_anomaly_detector.py   # 7-scenario anomaly detector unit test suite
-├── requirements.txt           # Python dependency manifest (with reportlab & joblib)
-├── esp8266_smartvolt.ino      # NodeMCU Arduino C++ firmware (115200 baud)
-├── README.md                  # Complete engineering documentation
+├── app.py                         # Industrial Streamlit SCADA dashboard (7 multi-page views)
+├── thingspeak_client.py           # ThingSpeak HTTPS Cloud API Client & Background Async Worker
+├── serial_reader.py               # Non-blocking USB serial daemon, stale detection & Simulation Lab
+├── model.py                       # Hybrid Anomaly Detector (Thresholds + MAD + Isolation Forest + Joblib)
+├── database.py                    # SQLite persistence layer (WAL mode, query filtering, cooldown)
+├── reports.py                     # PDF audit report generator (ReportLab) & CSV exporter
+├── test_thingspeak.py             # 10-scenario offline unit test suite for Cloud API with mocked requests
+├── test_smartvolt_suite.py        # 8-scenario comprehensive automated test suite
+├── test_anomaly_detector.py       # 7-scenario anomaly detector unit test suite
+├── requirements.txt               # Python dependency manifest (with requests, reportlab & joblib)
+├── esp8266_smartvolt.ino          # NodeMCU Arduino C++ firmware (115200 baud)
+├── .streamlit/
+│   └── secrets.toml.example       # Template for configuring ThingSpeak API keys securely
+├── README.md                      # Complete engineering documentation
 └── data/
-    ├── smartvolt.db           # SQLite database for telemetry and event audit logs
-    ├── models/                # Saved Scikit-Learn Isolation Forest models (.joblib)
-    └── sample_telemetry.csv   # Pre-recorded benchmark telemetry dataset
+    ├── smartvolt.db               # SQLite database for telemetry and event audit logs
+    ├── models/                    # Saved Scikit-Learn Isolation Forest models (.joblib)
+    └── sample_telemetry.csv       # Pre-recorded benchmark telemetry dataset
 ```
 
 ### Module Descriptions:
-- **`app.py`**: Industrial SCADA dashboard featuring 6 specialized pages: Live Overview, Simulation Lab, Historical Analytics, Model Evaluation, Reports & Audit Export, and Diagnostics.
+- **`app.py`**: Industrial SCADA dashboard featuring 7 specialized pages: Live Overview, Simulation Lab, Historical Analytics, Model Evaluation, Reports & Audit Export, ThingSpeak Cloud Telemetry, and Diagnostics.
+- **`thingspeak_client.py`**: Cloud integration module handling HTTPS REST uploads, Free-tier rate-limiting compliance ($\ge 15\,\text{s}$ interval), credential masking, non-blocking daemon queuing, and Read API historical feed retrieval.
+- **`test_thingspeak.py`**: Automated unit test suite with 10 mocked HTTP test cases covering upload success, rate limiting (response `'0'`), HTTP status codes, sensor sanity checking, network timeouts, credential redaction, and private channel feed retrieval.
 - **`serial_reader.py`**: Multithreaded background worker with stale link detection and an expanded 8-scenario simulation engine with expected vs actual response mapping.
 - **`model.py`**: Hybrid anomaly engine combining two-stage deterministic limits, rolling median & MAD with safe zero-variance floor, debounced persistence, Isolation Forest with Joblib model saving/loading, and zero-leakage comparative benchmarking.
 - **`database.py`**: Robust SQLite persistence engine storing all readings and anomaly events with duplicate cooldown throttling and advanced filtering.
 - **`reports.py`**: Generates publication-grade multi-page PDF inspection reports with summary statistics, confusion matrix benchmarks, event logs, and safety notices.
 - **`test_smartvolt_suite.py`**: Automated test suite verifying serial parsing, validation, thresholds, MAD statistics, ML persistence, SQLite writes, simulation labeling, and report generation.
+
+---
+
+## ☁️ ThingSpeak Cloud Integration & Remote Monitoring (Option B)
+
+### 1. Architecture Overview (Option B: Python Gateway)
+
+The cloud telemetry pipeline is implemented using **Option B: Python Gateway Architecture**. Physical telemetry from the ESP8266 + DS18B20 sensor is ingested via USB serial (115200 baud), validated by statistical edge sanity filters, and uploaded over TLS/HTTPS to ThingSpeak's REST API (`https://api.thingspeak.com/update`).
+
+```
++------------------+         +------------------+         +----------------------+         +---------------------+
+|  DS18B20 Sensor  | 1-Wire  | ESP8266 NodeMCU  | USB UART| Python Async Gateway |  HTTPS  |  ThingSpeak Cloud   |
+| Waterproof Probe |-------->| GPIO 2 (Pin D4)  |-------->| (thingspeak_client)  |-------->| (api.thingspeak.com)|
+| (-55°C to +125°C)|         | (115200 Baud)    |         | Throttled >= 15s     |         | Field 1: Temp (°C)  |
++------------------+         +------------------+         +----------------------+         +---------------------+
+```
+
+#### Why Option B is Superior for College & Laboratory Presentations:
+1. **Preserves Existing Firmware:** The working Arduino sketch `esp8266_smartvolt.ino` remains completely untouched. No re-flashing or risk of breaking serial output.
+2. **Campus Wi-Fi Independence:** University and corporate Wi-Fi networks typically enforce **WPA2-Enterprise (802.1X)** authentication requiring username/passwords and digital certificates that low-cost ESP8266 boards cannot easily negotiate. Option B uses the laptop's existing internet connection seamlessly.
+3. **Hardware Safety Isolation:** Raw sensor noise and fault codes (`-127.00°C`, `85.00°C`) are validated and filtered at the Edge before reaching cloud servers.
+4. **Zero Latency on Dashboard:** Telemetry transmission runs in a dedicated background daemon thread (`ThingSpeakBackgroundWorker`), preventing UI freezing or serial buffer drops.
+
+---
+
+### 2. ThingSpeak Channel Field Mapping
+
+| Channel Field | Parameter | Data Source | Safety & Validation Rules |
+|---|---|---|---|
+| **Field 1** | Temperature (°C) | Physical DS18B20 Probe | Validated numeric values between $-55.0^\circ\text{C}$ and $+125.0^\circ\text{C}$. Rejects fault codes. |
+| **Field 2** | Voltage (V) | Reserved | **STRICT INTERLOCK: OMITTED & DISABLED.** Never sends simulated voltage as a real measurement. Hardware voltage monitoring remains locked until bench calibration. |
+| **Status** | Gateway Metadata | Text String | Appends packet origin and node status (e.g. `SmartVolt AI | HARDWARE`). |
+
+---
+
+### 3. Rate-Limiting Compliance & Free-Tier Rules
+
+ThingSpeak Free tier accounts enforce a strict rate limit: **minimum 15 seconds between updates**.
+- If requests are sent faster than 15 seconds, ThingSpeak responds with HTTP 200 and a body of **`"0"`**, indicating the data was dropped.
+- The `ThingSpeakClient` and `ThingSpeakBackgroundWorker` enforce an internal rate-limit floor of **$\ge 15.0\,\text{s}$**.
+- High-frequency 1 Hz serial readings are consumed locally for real-time charting, while the cloud uploader automatically queues the most recent valid sample and dispatches it once the 15-second window elapses.
+
+---
+
+### 4. Credential Security & Privacy Protocol
+
+> [!IMPORTANT]
+> **API keys are NEVER hardcoded into source files, committed to Git, or displayed in plain text.**
+
+Credentials are read with the following priority:
+1. **Streamlit Secrets:** `.streamlit/secrets.toml`
+2. **OS Environment Variables:** `THINGSPEAK_CHANNEL_ID`, `THINGSPEAK_WRITE_API_KEY`, `THINGSPEAK_READ_API_KEY`, `THINGSPEAK_UPLOAD_INTERVAL`
+3. **Session UI Inputs:** Entered during the session via the Cloud Telemetry dashboard.
+
+All displayed API keys are masked using `mask_key()` (e.g., `••••••••7G8H` or `••••••••`). `.streamlit/secrets.toml` is included in `.gitignore` to prevent credential leakage.
+
+---
+
+### 5. Step-by-Step ThingSpeak Setup Guide
+
+Follow these steps to link your SmartVolt AI installation to your ThingSpeak channel:
+
+#### Step A: Create Channel on ThingSpeak
+1. Go to [https://thingspeak.com](https://thingspeak.com) and sign in (or create a free MathWorks account).
+2. Click **Channels** $\to$ **My Channels** $\to$ **New Channel**.
+3. Fill in the channel settings:
+   - **Name:** `SmartVolt AI Telemetry`
+   - **Description:** `IoT Voltage & Temperature Anomaly Detection Supervisory Node`
+   - **Field 1:** Check box and name it `Temperature (C)`
+   - **Field 2:** Check box and name it `Voltage (V)` *(Reserved)*
+4. Click **Save Channel**.
+
+#### Step B: Obtain API Keys
+1. In your new channel, click the **API Keys** tab.
+2. Note your **Channel ID** (a 7-digit number, e.g., `2865432`).
+3. Copy your **Write API Key** (16-character alphanumeric string).
+4. If your channel is private, also copy your **Read API Key**.
+
+#### Step C: Configure Secrets in SmartVolt AI
+Create the file `.streamlit/secrets.toml` (you can copy `.streamlit/secrets.toml.example`):
+```toml
+[thingspeak]
+channel_id = "2865432"               # Replace with your actual Channel ID
+write_api_key = "XXXXXXXXXXXXXXXX"   # Replace with your 16-character Write API Key
+read_api_key = "YYYYYYYYYYYYYYYY"    # Replace with your Read API Key (if private)
+upload_interval = 15                 # Minimum 15 seconds for Free tier
+```
+
+*Alternative (Environment Variables):*
+```powershell
+$env:THINGSPEAK_CHANNEL_ID="2865432"
+$env:THINGSPEAK_WRITE_API_KEY="XXXXXXXXXXXXXXXX"
+$env:THINGSPEAK_READ_API_KEY="YYYYYYYYYYYYYYYY"
+$env:THINGSPEAK_UPLOAD_INTERVAL="15"
+```
+
+---
+
+### 6. Testing & Verifying Cloud Integration
+
+#### Step 1: Run Offline Test Suite
+Verify that all cloud endpoints, rate-limiting handlers, and mocked HTTP calls pass before connecting to live hardware:
+```powershell
+python test_thingspeak.py
+```
+*(All 10 unit tests will run and pass with `OK`).*
+
+#### Step 2: Start the Dashboard
+```powershell
+streamlit run app.py
+```
+
+#### Step 3: Test Connection in Dashboard
+1. Open the sidebar and select **☁️ ThingSpeak Cloud Telemetry**.
+2. Click **🧪 Test Connection**.
+   - If configured correctly, you will receive: `✅ Connection verified! Channel Name: 'SmartVolt AI Telemetry' (ID: ...)`.
+   - The test incorporates a 5-second cooldown to prevent API flooding.
+
+#### Step 4: Verify Real-Time Upload
+1. In the sidebar or Cloud Telemetry page, check the box: **🟢 Enable Automatic Cloud Uplink**.
+2. If real hardware is connected, valid temperature readings will upload every 15 seconds.
+3. Check the **Cloud Gateway Activity & Upload Log** table in the dashboard to view Entry IDs and HTTP response times.
+4. Open your [ThingSpeak Channel View](https://thingspeak.com) in your web browser. You will observe live temperature points populating the **Field 1** chart in real time!
+5. Back in the dashboard, scroll down to **Remote Cloud History & Field Visualization** and click **🔄 Fetch Live Cloud Feeds** to pull the cloud feed back into SmartVolt AI via the ThingSpeak Read API.
+
+---
 
 ---
 
@@ -360,6 +493,20 @@ Follow this structured 5-minute procedure during your laboratory project present
 
 ---
 
+### Q8: Why did you implement ThingSpeak cloud integration using an Edge Gateway (Option B) rather than flashing Wi-Fi code directly onto the ESP8266?
+> **Answer:** Option B separates embedded sensor acquisition from cloud networking, providing significant engineering advantages:
+> 1. **Firmware Stability:** Preserves the verified, low-jitter 1-Wire DS18B20 sampling routine on the ESP8266 without introducing network disconnect handling or Wi-Fi reconnection stalls.
+> 2. **Enterprise Wi-Fi Compatibility:** University networks use 802.1X WPA2-Enterprise protocols that standard ESP8266 hardware cannot negotiate. The host PC gateway connects seamlessly through the laptop's network interface.
+> 3. **Edge Validation & Rate-Limiting:** Telemetry is statistically validated, debounced, and checked for sensor faults at the edge. Fault codes (`-127.00°C`) are prevented from polluting cloud charts.
+> 4. **TLS/HTTPS Security:** Encrypted TLS sessions are offloaded from the 80 MHz microcontroller to the PC, avoiding heap exhaustion and buffer overflows on the chip.
+
+---
+
+### Q9: How does the software handle ThingSpeak's Free-tier 15-second rate limit?
+> **Answer:** ThingSpeak Free tier returns HTTP 200 with a body of `'0'` if updates arrive faster than once every 15 seconds. In SmartVolt AI, the `ThingSpeakBackgroundWorker` runs an asynchronous daemon thread that tracks `last_upload_time`. When fresh 1 Hz serial readings arrive, they update local charts immediately, but only the most recent validated sample is uploaded to ThingSpeak once $\Delta t \ge 15.0\,\text{s}$. This guarantees zero API rate-limit violations while maintaining real-time local supervisory monitoring.
+
+---
+
 ## 🛠️ Troubleshooting & FAQs
 
 ### Problem 1: `serial.serialutil.SerialException: could not open port 'COMx': PermissionError(13, 'Access is denied.')`
@@ -383,6 +530,23 @@ Follow this structured 5-minute procedure during your laboratory project present
   1. Open Windows **Device Manager** and expand **Ports (COM & LPT)**.
   2. If a device appears with a yellow exclamation mark (e.g. `USB2.0-Serial` or `CP2102`), install the appropriate **CH340G** or **Silicon Labs CP210x** VCP driver for Windows.
   3. Re-plug the USB cable and click the **🔄 (Refresh)** button in the sidebar.
+
+---
+
+### Problem 4: ThingSpeak returns `ThingSpeak update failed (Rate limited or incorrect Write API Key)`
+- **Root Cause:** Either the Write API Key is incorrect, or requests are being submitted within less than 15 seconds of the previous post.
+- **Solution:**
+  1. Verify your 16-character Write API Key under your Channel's **API Keys** tab on [thingspeak.com](https://thingspeak.com).
+  2. Keep the upload interval set to at least 15 seconds (default).
+  3. Ensure no other scripts or devices are writing to the same channel simultaneously.
+
+---
+
+### Problem 5: ThingSpeak returns `HTTP 404: Channel ID not found` or `HTTP 400/403`
+- **Root Cause:** The Channel ID is mistyped, or the channel is Private and the Read API Key was omitted when attempting to fetch feeds.
+- **Solution:**
+  1. Copy the numeric Channel ID directly from the ThingSpeak dashboard (e.g. `2865432`).
+  2. For private channels, enter your **Read API Key** in `.streamlit/secrets.toml` or the Cloud Telemetry configuration form.
 
 ---
 

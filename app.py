@@ -21,8 +21,10 @@ import database
 import model
 import reports
 import serial_reader
+import thingspeak_client
 from serial_reader import SmartVoltSerialManager, SmartVoltSimulationEngine, list_available_ports
 from model import SmartVoltHybridAnomalyDetector
+from thingspeak_client import ThingSpeakBackgroundWorker, ThingSpeakClient, mask_key, load_credentials_from_environment
 
 
 # -----------------------------------------------------------------------------
@@ -191,6 +193,10 @@ def get_anomaly_detector() -> SmartVoltHybridAnomalyDetector:
         random_state=42
     )
 
+@st.cache_resource
+def get_thingspeak_worker() -> ThingSpeakBackgroundWorker:
+    return ThingSpeakBackgroundWorker()
+
 # Initialize Session State
 if "telemetry_buffer" not in st.session_state:
     st.session_state.telemetry_buffer = []
@@ -202,6 +208,7 @@ if "navigation_page" not in st.session_state:
 serial_mgr = get_serial_manager()
 sim_engine = get_simulation_engine()
 detector = get_anomaly_detector()
+ts_worker = get_thingspeak_worker()
 
 
 # -----------------------------------------------------------------------------
@@ -213,24 +220,22 @@ with st.sidebar:
     st.markdown("---")
 
     # Primary Navigation Selector
+    nav_options = [
+        "📊 Live Telemetry & Overview",
+        "🧪 Simulation & Test Lab",
+        "📈 Historical Trends & Analytics",
+        "🤖 Model Evaluation & Comparison",
+        "📑 Reports & Audit Export",
+        "☁️ ThingSpeak Cloud Telemetry",
+        "⚙️ Diagnostics & Device Health"
+    ]
+    cur_nav = st.session_state.navigation_page
+    nav_idx = nav_options.index(cur_nav) if cur_nav in nav_options else 0
+
     page = st.radio(
         "Navigation Menu",
-        options=[
-            "📊 Live Telemetry & Overview",
-            "🧪 Simulation & Test Lab",
-            "📈 Historical Trends & Analytics",
-            "🤖 Model Evaluation & Comparison",
-            "📑 Reports & Audit Export",
-            "⚙️ Diagnostics & Device Health"
-        ],
-        index=[
-            "📊 Live Telemetry & Overview",
-            "🧪 Simulation & Test Lab",
-            "📈 Historical Trends & Analytics",
-            "🤖 Model Evaluation & Comparison",
-            "📑 Reports & Audit Export",
-            "⚙️ Diagnostics & Device Health"
-        ].index(st.session_state.navigation_page)
+        options=nav_options,
+        index=nav_idx
     )
     st.session_state.navigation_page = page
 
@@ -297,6 +302,29 @@ with st.sidebar:
         st.info("Baseline reset. Now acquiring 30 fresh baseline samples.")
         st.rerun()
 
+    st.markdown("---")
+    st.subheader("☁️ ThingSpeak Cloud")
+    ts_stat = ts_worker.get_status()
+    is_cfg = ts_stat["credentials"]["is_configured"]
+
+    if is_cfg:
+        cloud_active = st.checkbox(
+            "Enable Cloud Uplink",
+            value=ts_worker.is_enabled,
+            help="Uploads live readings over HTTPS to ThingSpeak Field 1 (>=15s interval)."
+        )
+        ts_worker.set_enabled(cloud_active)
+        if cloud_active:
+            st.markdown('<span class="status-normal">🟢 UPLINK ACTIVE</span>', unsafe_allow_html=True)
+            if ts_stat["seconds_since_last_upload"] is not None:
+                st.caption(f"Last post: {ts_stat['seconds_since_last_upload']}s ago (ID: {ts_stat['last_successful_entry_id'] or '--'})")
+        else:
+            st.markdown('<span class="status-warning">⚪ UPLINK PAUSED</span>', unsafe_allow_html=True)
+        st.caption(f"Channel: `{ts_stat['credentials']['channel_id']}` | Key: `{ts_stat['credentials']['masked_write_key']}`")
+    else:
+        st.markdown('<span class="status-warning">⚠️ NOT CONFIGURED</span>', unsafe_allow_html=True)
+        st.caption("Configure credentials in the Cloud Telemetry page or secrets.toml.")
+
 
 # -----------------------------------------------------------------------------
 # 4. Ingestion & Persistence Engine
@@ -354,7 +382,16 @@ def ingest_telemetry_stream():
         # 2. Persist to SQLite Database
         database.insert_reading(record)
 
-        # 3. Log Event if Anomaly or Threshold Alert occurred
+        # 3. Post to Non-blocking ThingSpeak Cloud Worker
+        if rec.get("is_valid") and rec.get("temperature") is not None:
+            ts_worker.post_reading(
+                temp_c=rec["temperature"],
+                voltage=rec.get("voltage"),
+                source=rec.get("source", "HARDWARE"),
+                device_status=record.get("device_status", "CONNECTED")
+            )
+
+        # 4. Log Event if Anomaly or Threshold Alert occurred
         if eval_res["is_anomaly"] or eval_res["threshold_alert"]:
             event = {
                 "timestamp": record["timestamp"],
@@ -383,7 +420,7 @@ ingest_telemetry_stream()
 st.title("⚡ SmartVolt AI — IoT Supervisory System")
 
 # Always-Visible Data Source & System State Indicator Bar
-col_h1, col_h2, col_h3 = st.columns([2, 1, 1])
+col_h1, col_h2, col_h3, col_h4 = st.columns([2, 1, 1, 1])
 with col_h1:
     if st.session_state.active_mode == "Real Hardware (USB Serial)":
         if serial_mgr.is_connected:
@@ -401,6 +438,16 @@ with col_h2:
     st.caption(f"💾 **SQLite Storage:** {db_stat['total_readings']} records ({db_stat['file_size_kb']} KB)")
 
 with col_h3:
+    ts_h = ts_worker.get_status()
+    if ts_h["credentials"]["is_configured"]:
+        if ts_worker.is_enabled:
+            st.caption(f"☁️ **ThingSpeak:** Active (Ch {ts_h['credentials']['channel_id']})")
+        else:
+            st.caption(f"☁️ **ThingSpeak:** Paused (Ch {ts_h['credentials']['channel_id']})")
+    else:
+        st.caption("☁️ **ThingSpeak:** Unconfigured")
+
+with col_h4:
     st.caption(f"🕒 **Last Synchronized:** {datetime.now().strftime('%H:%M:%S')}")
 
 st.markdown("---")
@@ -881,7 +928,241 @@ elif st.session_state.navigation_page == "📑 Reports & Audit Export":
 
 
 # =============================================================================
-# PAGE 6: ⚙️ DIAGNOSTICS & DEVICE HEALTH
+# PAGE 6: ☁️ THINGSPEAK CLOUD TELEMETRY
+# =============================================================================
+elif st.session_state.navigation_page == "☁️ ThingSpeak Cloud Telemetry":
+    st.header("☁️ ThingSpeak Cloud Telemetry & Remote Monitoring")
+    st.caption("Secure HTTPS telemetry uplink (Option B: Python Gateway). Uploads DS18B20 live temperature data to ThingSpeak Channel Field 1. Field 2 (Voltage) remains reserved and disabled until calibrated.")
+
+    st.markdown("""
+    <div style="background-color: #0c4a6e; border: 1px solid #0284c7; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #f0f9ff; font-size: 0.85rem;">
+        <strong>📡 THINSPEAK CLOUD ARCHITECTURE (OPTION B — PYTHON GATEWAY):</strong><br>
+        Physical telemetry from the ESP8266 + DS18B20 probe is ingested via USB serial (115200 baud) into the local Python runtime, 
+        validated by statistical sanity checks, and uploaded over outbound TLS/HTTPS to <code>https://api.thingspeak.com/update</code>.<br>
+        • <strong>Field 1:</strong> Physical Temperature (°C) from DS18B20 probe.<br>
+        • <strong>Field 2:</strong> Reserved for Voltage (V). <em>Strictly locked and omitted from requests until sensor calibration is benchtop-verified.</em><br>
+        • <strong>Rate-Limiting:</strong> Enforces &ge; 15s interval between cloud posts to strictly comply with ThingSpeak Free tier constraints.<br>
+        • <strong>Credential Privacy:</strong> API keys are loaded securely from <code>.streamlit/secrets.toml</code> or environment variables and masked across all displays.
+    </div>
+    """, unsafe_allow_html=True)
+
+    ts_stat = ts_worker.get_status()
+    creds = ts_stat["credentials"]
+    is_cfg = creds["is_configured"]
+
+    # 4 Status Metric Cards
+    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+    with col_c1:
+        cfg_badge = '<span class="status-normal">🟢 CONFIGURED</span>' if is_cfg else '<span class="status-warning">⚠️ NOT CONFIGURED</span>'
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Channel Configuration</div>
+            <div style="margin: 4px 0;">{cfg_badge}</div>
+            <div class="metric-subtitle">ID: {creds['channel_id'] or 'None'} | Key: {creds['masked_write_key']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_c2:
+        if not is_cfg:
+            up_badge = '<span class="status-warning">⚪ STANDBY (NO KEYS)</span>'
+        elif ts_worker.is_enabled:
+            up_badge = '<span class="status-normal">🟢 UPLINK ACTIVE</span>'
+        else:
+            up_badge = '<span class="status-warning">⏸ PAUSED</span>'
+
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Uplink Gateway</div>
+            <div style="margin: 4px 0;">{up_badge}</div>
+            <div class="metric-subtitle">Worker: Background Async Daemon</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_c3:
+        sec_since = ts_stat["seconds_since_last_upload"]
+        since_str = f"{sec_since:.1f}s ago" if sec_since is not None else "No uploads yet"
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Update Interval</div>
+            <div class="metric-value" style="font-size: 1.6rem; color: #38bdf8;">{creds['upload_interval']}s</div>
+            <div class="metric-subtitle">Last post: {since_str}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_c4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Cloud Counters</div>
+            <div class="metric-value" style="font-size: 1.6rem; color: #10b981;">{ts_stat['success_count']} <span style="font-size: 0.9rem; color: #94a3b8;">/ {ts_stat['error_count']} err</span></div>
+            <div class="metric-subtitle">Last Entry ID: {ts_stat['last_successful_entry_id'] or '--'}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Configuration Form & Uplink Controls
+    col_cfg1, col_cfg2 = st.columns([1, 1])
+
+    with col_cfg1:
+        st.subheader("1. Channel Credentials & Settings")
+        st.caption("Credentials loaded from environment or `.streamlit/secrets.toml`. You can also enter or override them below for this session:")
+
+        with st.form("thingspeak_credentials_form"):
+            in_channel_id = st.text_input("ThingSpeak Channel ID", value=creds["channel_id"], help="Your numeric ThingSpeak Channel ID (e.g., 2865432)")
+            in_write_key = st.text_input("Write API Key", type="password", placeholder=creds["masked_write_key"], help="16-character ThingSpeak Write API Key (never logged or exposed)")
+            in_read_key = st.text_input("Read API Key (Optional)", type="password", placeholder=creds["masked_read_key"], help="Required if your channel is private and you want to view cloud history")
+            in_interval = st.slider("Upload Interval (seconds)", min_value=15, max_value=120, value=creds["upload_interval"], step=5, help="Free accounts require at least 15 seconds between updates")
+
+            btn_save = st.form_submit_button("💾 Save Credentials & Settings", use_container_width=True)
+            if btn_save:
+                kw = {"upload_interval": in_interval}
+                if in_channel_id.strip():
+                    kw["channel_id"] = in_channel_id.strip()
+                if in_write_key.strip():
+                    kw["write_api_key"] = in_write_key.strip()
+                if in_read_key.strip():
+                    kw["read_api_key"] = in_read_key.strip()
+
+                ts_worker.client.update_credentials(**kw)
+                st.success("Credentials and interval updated successfully for current session!")
+                st.rerun()
+
+        st.info("💡 **Persistent Setup:** Create `.streamlit/secrets.toml` with your credentials so you don't need to re-enter them every time. See `README.md` or `.streamlit/secrets.toml.example`.")
+
+    with col_cfg2:
+        st.subheader("2. Uplink Controls & Operations")
+
+        # Uplink switch
+        enable_toggle = st.checkbox(
+            "🟢 Enable Automatic Cloud Uplink",
+            value=ts_worker.is_enabled,
+            help="When checked, incoming valid readings are periodically sent to ThingSpeak in the background."
+        )
+        ts_worker.set_enabled(enable_toggle)
+
+        # Simulation mode permission switch
+        allow_sim_toggle = st.checkbox(
+            "🧪 Allow Simulated Telemetry Upload (Test Mode Only)",
+            value=ts_worker.allow_simulated_upload,
+            help="ACADEMIC INTEGRITY SAFETY: Prevents simulated test runs from polluting your production ThingSpeak channel. Only enable if testing a dedicated sandbox channel."
+        )
+        ts_worker.set_allow_simulated(allow_sim_toggle)
+        if allow_sim_toggle:
+            st.warning("⚠️ Test Mode enabled: Simulated values may be posted to ThingSpeak Field 1 with '[SIMULATED]' tag.")
+
+        st.markdown("---")
+        st.markdown("**Cloud Operations & Verification:**")
+
+        col_act1, col_act2 = st.columns(2)
+        with col_act1:
+            if st.button("🧪 Test Connection", use_container_width=True, help="Queries Channel metadata to verify connectivity without posting new data (enforces 5s cooldown)."):
+                test_res = ts_worker.client.test_connection()
+                if test_res["success"]:
+                    st.success(f"✅ {test_res['message']}")
+                else:
+                    st.error(f"❌ {test_res['message']}")
+
+        with col_act2:
+            latest_rec = st.session_state.telemetry_buffer[-1] if st.session_state.telemetry_buffer else None
+            can_upload = bool(latest_rec and latest_rec.get("temperature") is not None and latest_rec.get("is_valid"))
+            if st.button("⚡ Manual Upload Sample", disabled=not can_upload or not is_cfg, use_container_width=True, help="Uploads the latest valid reading immediately to verify cloud writing."):
+                res_man = ts_worker.trigger_immediate_upload(
+                    temp_c=latest_rec["temperature"],
+                    voltage=latest_rec.get("voltage"),
+                    is_simulated=(latest_rec["source"] == "SIMULATED")
+                )
+                if res_man["success"]:
+                    st.success(f"✅ {res_man['message']} ({res_man['duration_ms']}ms)")
+                else:
+                    st.error(f"❌ {res_man['message']}")
+
+        # Display last upload message
+        last_res = ts_stat["last_result"]
+        if last_res.get("message"):
+            st.caption(f"**Latest Gateway Message:** {last_res['message']} (at {last_res.get('timestamp', '--')})")
+
+    st.markdown("---")
+
+    # 3. Recent Cloud Transactions Feed
+    st.subheader("3. Cloud Gateway Activity & Upload Log")
+    recent_txs = ts_stat.get("history", [])
+    if recent_txs:
+        df_tx = pd.DataFrame(recent_txs)
+        display_cols = ["timestamp", "temp_c", "entry_id", "status_code", "duration_ms", "success", "message", "source"]
+        st.dataframe(df_tx[[c for c in display_cols if c in df_tx.columns]], use_container_width=True, height=180)
+    else:
+        st.info("No cloud upload attempts logged in this session yet. Enable the uplink or trigger a manual test above.")
+
+    st.markdown("---")
+
+    # 4. Cloud History View (ThingSpeak Read API)
+    st.subheader("4. Remote Cloud History & Field Visualization (ThingSpeak Read API)")
+    st.caption("Directly query stored cloud data points from `api.thingspeak.com/channels/<ID>/feeds.json` to verify cloud persistence.")
+
+    col_q1, col_q2 = st.columns([1, 3])
+    with col_q1:
+        q_results = st.selectbox("Feed Samples to Fetch", [10, 25, 50, 100, 200], index=2)
+        btn_fetch = st.button("🔄 Fetch Live Cloud Feeds", use_container_width=True)
+
+    if btn_fetch or "cloud_feeds_df" in st.session_state:
+        if btn_fetch:
+            with st.spinner("Contacting ThingSpeak Read API..."):
+                ok, msg, df_feeds, ch_meta = ts_worker.client.fetch_channel_feeds(results=q_results)
+                if ok:
+                    st.session_state.cloud_feeds_df = df_feeds
+                    st.session_state.cloud_channel_meta = ch_meta
+                    st.success(msg)
+                else:
+                    st.error(f"Failed to fetch cloud feeds: {msg}")
+
+        if "cloud_feeds_df" in st.session_state and not st.session_state.cloud_feeds_df.empty:
+            df_cloud = st.session_state.cloud_feeds_df
+            ch_meta = st.session_state.get("cloud_channel_meta", {})
+
+            st.write(f"**Channel Name:** `{ch_meta.get('name', 'N/A')}` | **Field 1 Name:** `{ch_meta.get('field1', 'Field 1')}` | **Last Entry ID:** `{ch_meta.get('last_entry_id', 'N/A')}`")
+
+            # Plotly Chart of Cloud Temperature
+            fig_cloud = go.Figure()
+            valid_cloud_temp = df_cloud.dropna(subset=["temperature_c"])
+            if not valid_cloud_temp.empty:
+                fig_cloud.add_trace(go.Scatter(
+                    x=valid_cloud_temp["created_at"],
+                    y=valid_cloud_temp["temperature_c"],
+                    mode="lines+markers",
+                    name="ThingSpeak Field 1 (Temp °C)",
+                    line=dict(color="#38bdf8", width=2),
+                    marker=dict(size=6, color="#0284c7")
+                ))
+
+            fig_cloud.update_layout(
+                title=f"Cloud Telemetry Trajectory (Channel {ts_worker.client.channel_id})",
+                template="plotly_dark",
+                paper_bgcolor="rgba(15, 23, 42, 0.6)",
+                plot_bgcolor="rgba(15, 23, 42, 0.8)",
+                height=350,
+                xaxis=dict(title="Cloud Timestamp (UTC)", showgrid=True, gridcolor="#334155"),
+                yaxis=dict(title="Temperature (°C)", showgrid=True, gridcolor="#334155")
+            )
+            st.plotly_chart(fig_cloud, use_container_width=True)
+
+            col_cf1, col_cf2 = st.columns([3, 1])
+            with col_cf1:
+                st.markdown("**Cloud Feeds Table:**")
+                st.dataframe(df_cloud.tail(50), use_container_width=True)
+            with col_cf2:
+                st.markdown("**Export Cloud Data:**")
+                csv_cloud = df_cloud.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 Export Cloud Feeds (CSV)",
+                    data=csv_cloud,
+                    file_name=f"thingspeak_channel_{ts_worker.client.channel_id}_feeds.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+
+# =============================================================================
+# PAGE 7: ⚙️ DIAGNOSTICS & DEVICE HEALTH
 # =============================================================================
 elif st.session_state.navigation_page == "⚙️ Diagnostics & Device Health":
     st.header("⚙️ Diagnostics & Physical Hardware Link Status")
@@ -914,7 +1195,22 @@ elif st.session_state.navigation_page == "⚙️ Diagnostics & Device Health":
         st.write(f"- **Model Trained At:** `{detector.model_trained_at or 'Not yet saved'}`")
 
     st.markdown("---")
-    st.subheader("3. Hardware Safety & ADC Interlock Verification")
+    st.subheader("3. ThingSpeak Cloud Gateway Diagnostics")
+    col_ts1, col_ts2 = st.columns(2)
+    ts_diag = ts_worker.get_status()
+    with col_ts1:
+        st.write(f"- **Cloud Uplink Active:** `{'YES (Running)' if ts_diag['is_enabled'] else 'NO (Paused)'}`")
+        st.write(f"- **Configured Channel ID:** `{ts_diag['credentials']['channel_id'] or 'Not Configured'}`")
+        st.write(f"- **Write Key (Redacted):** `{ts_diag['credentials']['masked_write_key']}`")
+        st.write(f"- **Read Key (Redacted):** `{ts_diag['credentials']['masked_read_key']}`")
+    with col_ts2:
+        st.write(f"- **Upload Interval:** `{ts_diag['credentials']['upload_interval']} seconds`")
+        st.write(f"- **Successful Uploads:** `{ts_diag['success_count']}`")
+        st.write(f"- **Failed Uploads:** `{ts_diag['error_count']}`")
+        st.write(f"- **Last Gateway Response:** `{ts_diag['last_result']['message']}`")
+
+    st.markdown("---")
+    st.subheader("4. Hardware Safety & ADC Interlock Verification")
     st.markdown("""
     <div class="safety-banner">
         <strong>HARDWARE VOLTAGE SENSOR STATUS: LOCKED</strong><br>

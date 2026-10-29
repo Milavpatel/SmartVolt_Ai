@@ -261,3 +261,4 @@ def generate_pdf_report(
 
     doc.build(story)
     return output_path
+

@@ -4,4 +4,8 @@ __pycache__/
 *.log
 data/*.db*
 data/*.pdf
+.env
+*.env
+.streamlit/secrets.toml
+secrets.toml
 

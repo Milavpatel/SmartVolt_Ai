@@ -312,3 +312,4 @@ def clear_database(db_path: str = DEFAULT_DB_PATH):
 
 # Initialize database automatically on module import
 init_db()
+
